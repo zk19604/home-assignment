@@ -1,0 +1,9 @@
+--extra-index-url https://download.pytorch.org/whl/cu124
+torch==2.5.1+cu124
+torchvision==0.20.1+cu124
+ultralytics==8.3.200
+av==16.0.1
+pyarrow==19.0.1
+numpy==1.26.4
+opencv-python-headless==4.11.0.86
+huggingface_hub==0.30.2
