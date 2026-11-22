@@ -174,12 +174,23 @@ class End:
     decoded: int = 0
     last_second: int = -1
     error: str = ""
+    decode_seconds: float = 0.0
 
 
 def decode_video(video: str, payload: bytes | None, batch_size: int, stride: int,
-                 threads: int, send: Callable[[Batch | End], None], cancel: Event) -> None:
+                 threads: int, send: Callable[[Batch | End], None], cancel: Event,
+                 source_seconds: int | None = None) -> None:
     """Decode in presentation order and submit homogeneous batches for one video."""
     end = End(video)
+    started = time.perf_counter()
+    send_seconds = 0.0
+
+    def submit(batch: Batch) -> None:
+        nonlocal send_seconds
+        before = time.perf_counter()
+        send(batch)
+        send_seconds += time.perf_counter() - before
+
     try:
         if not payload:
             raise ValueError("empty or null mp4")
@@ -230,6 +241,9 @@ def decode_video(video: str, payload: bytes | None, batch_size: int, stride: int
                 second = math.floor(stamp - t0)
                 if second < 0:
                     raise ValueError("timestamp precedes first frame")
+                if source_seconds is not None and second >= source_seconds:
+                    end.last_second = source_seconds - 1
+                    break
                 end.last_second = second
                 if stride > 1:
                     if second in seen and index % stride:
@@ -242,21 +256,22 @@ def decode_video(video: str, payload: bytes | None, batch_size: int, stride: int
                 pixels = rotate_frame(frame.to_ndarray(format="bgr24"), transform)
                 if batch.frames and (batch.frames[0].shape != pixels.shape or
                                      size + pixels.nbytes > 192 * MIB):
-                    send(batch)
+                    submit(batch)
                     batch, size = Batch(video, [], []), 0
                 batch.frames.append(pixels)
                 batch.seconds.append(second)
                 size += pixels.nbytes
                 if len(batch.frames) >= batch_size:
-                    send(batch)
+                    submit(batch)
                     batch, size = Batch(video, [], []), 0
             if batch.frames and not cancel.is_set():
-                send(batch)
+                submit(batch)
             if end.decoded == 0:
                 end.error = "could not decode video"
     except Exception as exc:
         end.error = short_error(exc)
     finally:
+        end.decode_seconds = time.perf_counter() - started - send_seconds
         send(end)
 
 
@@ -330,16 +345,20 @@ class VideoState:
     seconds: dict[int, Second] = field(default_factory=dict)
     cancel: Event = field(default_factory=Event)
     error: str = ""
+    inference_seconds: float = 0.0
 
 
 def consume(event: Batch | End, state: VideoState, detector: Detector, emit: Emit) -> None:
     if isinstance(event, Batch):
         if not state.error:
+            before = time.perf_counter()
             try:
                 detector.consume(event, state.seconds)
             except Exception as exc:
                 state.error = short_error(exc)
                 state.cancel.set()
+            finally:
+                state.inference_seconds += time.perf_counter() - before
         return
     error = state.error or event.error
     # For a failed video, the last inferred bucket may only be partly decoded.
@@ -349,7 +368,8 @@ def consume(event: Batch | End, state: VideoState, detector: Detector, emit: Emi
                        for s in range(start, min(last + 1, start + 128))]))
     if error:
         emit(("rows", [dict(video=event.video, error=error)]))
-    emit(("video", event.decoded, sum(len(s.people) for s in state.seconds.values())))
+    emit(("video", event.decoded, sum(len(s.people) for s in state.seconds.values()),
+          event.decode_seconds, state.inference_seconds))
 
 
 @dataclass
@@ -359,42 +379,67 @@ class FileStatus:
 
 
 def _parquet_rows(path: Path, limit: int | None,
-                  status: FileStatus) -> Iterator[tuple[str, bytes | None]]:
+                  status: FileStatus, emit: Emit) -> Iterator[tuple[str, bytes | None]]:
     """Read one mp4 cell at a time. Offsets include rows in unreadable groups."""
     with pq.ParquetFile(path) as parquet:
-        if "mp4" not in parquet.schema_arrow.names:
-            raise ValueError("missing mp4 column")
         total = parquet.metadata.num_rows
         wanted = total if limit is None else min(limit, total)
+
+        def report_unread(index: int, reason: str) -> None:
+            emit(("rows", [dict(video=f"{path.name}:{index}", error=reason)]))
+            emit(("video", 0, 0))
+
+        if "mp4" not in parquet.schema_arrow.names:
+            for index in range(wanted):
+                report_unread(index, "missing mp4 column")
+            status.complete = wanted == total
+            return
         offset = 0
         for group in range(parquet.num_row_groups):
             if offset >= wanted:
                 break
-            count = parquet.metadata.row_group(group).num_rows
+            try:
+                count = parquet.metadata.row_group(group).num_rows
+            except Exception as exc:
+                # The file footer still gives a row range even if this group's
+                # descriptor cannot tell us where the following group begins.
+                reason = short_error(exc)
+                log(f"{path.name} row group {group}: {reason}")
+                for index in range(offset, wanted):
+                    report_unread(index, reason)
+                break
             read = 0
             try:
                 batches = parquet.iter_batches(batch_size=1, columns=["mp4"],
                                                row_groups=[group], use_threads=False)
                 for batch in batches:
                     for cell in batch.column(0):
-                        yield f"{path.name}:{offset + read}", cell.as_py()
+                        index = offset + read
                         read += 1
+                        try:
+                            payload = cell.as_py()
+                        except Exception as exc:
+                            report_unread(index, short_error(exc))
+                            continue
+                        yield f"{path.name}:{index}", payload
                     if offset + read >= wanted:
                         break
                 if read != min(count, wanted - offset):
                     raise ValueError("unexpected row count")
             except Exception as exc:
-                status.error = short_error(exc)
-                log(f"{path.name} row group {group}: {status.error}")
+                reason = short_error(exc)
+                log(f"{path.name} row group {group}: {reason}")
+                for index in range(offset + read, min(offset + count, wanted)):
+                    report_unread(index, reason)
             offset += count
         status.complete = wanted == total and not status.error
 
 
 def iter_videos(path: Path, limit: int | None,
-                status: FileStatus) -> Iterator[tuple[str, bytes | None]]:
+                status: FileStatus, emit: Emit) -> Iterator[tuple[str, bytes | None]]:
     """Isolate file-open, footer and schema failures from subsequent shards."""
     try:
-        yield from _parquet_rows(path, limit, status)
+        yield from _parquet_rows(path, limit, status, emit)
     except Exception as exc:
         status.complete = False
         status.error = short_error(exc)
@@ -444,17 +489,34 @@ def pipeline(rows: Iterator, detector: Detector, args: argparse.Namespace, emit:
 
 def run_files(paths: list[Path], args: argparse.Namespace, device: str, emit: Emit) -> None:
     detector = Detector(args, device)
+    remaining = args.source_seconds
+
+    def count_seconds(event: tuple) -> None:
+        nonlocal remaining
+        if remaining is not None and event[0] == "rows":
+            remaining -= sum("second" in row for row in event[1])
+        emit(event)
+
     for path in paths:
+        if remaining == 0:
+            break
         status = FileStatus()
-        with closing(iter_videos(path, args.limit_videos, status)) as rows:
+        with closing(iter_videos(path, args.limit_videos, status, emit)) as rows:
             if args.reference:
+                from reference import reference_video
+                for video, payload in rows:
+                    reference_video(video, payload, detector.model, detector.options["device"], emit)
+            elif remaining is not None:
                 for video, payload in rows:
                     state = VideoState()
 
                     def accept(event: Batch | End) -> None:
-                        consume(event, state, detector, emit)
+                        consume(event, state, detector, count_seconds)
 
-                    decode_video(video, payload, 1, 1, 1, accept, state.cancel)
+                    decode_video(video, payload, args.batch, args.stride, 2, accept,
+                                 state.cancel, remaining)
+                    if remaining == 0:
+                        break
             else:
                 pipeline(rows, detector, args, emit)
         if status.error:
@@ -547,6 +609,9 @@ class Writer:
             self.stats["videos"] += 1
             self.stats["decoded"] += args[0]
             self.stats["inferred"] += args[1]
+            if len(args) == 4:
+                self.stats["decode_s"] += args[2]
+                self.stats["inference_s"] += args[3]
         elif kind == "file":
             name, complete = args
             self.stats["files"] += 1
@@ -563,6 +628,9 @@ class Writer:
                 f"{s['decoded'] / max(now - self.start, 1e-6):.1f} decoded frames/s, "
                 f"{s['inferred']} inferred frames")
             self.last = now
+            if kind == "file" and "decode_s" in s:
+                log(f"stage totals: {s['decode_s']:.2f} decoder-worker seconds, "
+                    f"{s['inference_s']:.2f} inference and counting seconds")
 
 
 def positive(value: str) -> int:
@@ -594,6 +662,8 @@ def main() -> None:
     parser.add_argument("--reference", action="store_true", help="serial FP32 validation mode")
     parser.add_argument("--resume", action="store_true", help="skip checkpointed files")
     parser.add_argument("--limit-videos", type=nonnegative, help="first N rows of each file")
+    parser.add_argument("--source-seconds", type=positive,
+                        help="stop after N output seconds of source footage, including gaps")
     parser.add_argument("--limit-files", type=nonnegative, help="first N remaining files")
     args = parser.parse_args()
     args.weights = args.weights.resolve()
@@ -607,6 +677,8 @@ def main() -> None:
         parser.error("--devices requires distinct numeric GPU indices or cpu")
     if args.reference:
         devices = devices[:1]
+    if args.source_seconds and (args.reference or args.resume or len(devices) != 1):
+        parser.error("--source-seconds requires one device and a fresh fast-mode output")
     paths = sorted((p for p in args.input.glob("*.parquet") if p.is_file()), key=lambda p: p.name)
     output = args.output
     side = Path(str(output) + ".done")

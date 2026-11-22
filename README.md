@@ -10,13 +10,11 @@ Use Python 3.11 and an NVIDIA driver compatible with the CUDA 12.4 PyTorch wheel
 python -m venv .venv
 source .venv/bin/activate
 python -m pip install --upgrade pip
-grep -v '^ultralytics==' requirements.txt | python -m pip install -r /dev/stdin \
-    matplotlib pillow pyyaml requests scipy psutil polars ultralytics-thop tqdm
-python -m pip install --no-deps ultralytics==8.3.200
+pip install -r requirements.txt
 python prepare.py
 ```
 
-The two pip commands install the pinned headless OpenCV wheel. Upstream Ultralytics declares the GUI OpenCV distribution as a dependency, so installing its wheel separately avoids having two distributions own the same `cv2` module. The PyTorch and torchvision pins are a matched CUDA pair.
+The requirements use the official headless Ultralytics 8.3.250 distribution, headless OpenCV, and the matched CUDA 12.4 torch and torchvision wheels. The reference decoder executable ships in the imageio-ffmpeg wheel. [Ultralytics headless release](https://pypi.org/project/ultralytics-opencv-headless/8.3.250/)
 
 `prepare.py` fetches the official `yolo11l.pt` using Ultralytics and loads it before placing it beside `run.py`. It verifies an existing local copy on subsequent runs. Move that checkpoint with the project to an offline grader. Keep package installation, weight preparation and dataset acquisition outside the timed run.
 
@@ -36,7 +34,8 @@ python run.py --input /data/shards --output results.jsonl
 | `--batch N` | `32` | Maximum frames per prediction call. |
 | `--half` / `--no-half` | on for CUDA | Enable FP16 or force FP32. CPU and reference mode use FP32. |
 | `--stride N` | `1` | Sample every Nth decoded frame and the first frame of every occupied second. |
-| `--reference` | off | Use the first selected device, FP32, batch 1, stride 1, and one synchronous decoder with one codec thread. |
+| `--reference` | off | Use the first selected device, FP32, batch 1, native FFmpeg autorotation and independent per-second voting. |
+| `--source-seconds N` | unlimited | Process a prefix covering N output seconds across videos. The final video may be clipped. This mode processes one video at a time on one device. |
 | `--resume` | off | Skip fully checkpointed files and append results. The default starts a fresh output and checkpoint. |
 | `--limit-files N` | all | Select the first N remaining sorted shards after applying resume. |
 | `--limit-videos N` | all | Select the first N rows per shard. A partially selected shard stays eligible for a full run. |
@@ -56,11 +55,13 @@ Multiple devices receive disjoint slices of the sorted file list. One spawned pr
 
 Class IDs transfer from the GPU once per batch. Per-frame counts use NumPy `bincount`. An object appears when its detection count is positive in at least half the sampled frames in a second. People counts include zeros and use the median rounded down. Objects retain the order person, car, dog, laptop, cell phone. Timestamp gaps produce an empty object list and zero people.
 
-Results flush as videos finish. A failed video gets one error record and may also have earlier completed seconds. A shard with a bad footer or unreadable row group gets a `<basename>:file` error and remains eligible for retry. A shard whose rows were all visited is complete even when individual videos produced errors. Stderr reports files finished, videos finished, decoded frames per elapsed second and inferred frame counts.
+Results flush as videos finish. A failed video gets one error record and may also have earlier completed seconds. If a row group fails, its footer supplies the IDs of the remaining selected rows. Each gets its own error record and processing continues at the next group. An unreadable file or footer gets a `<basename>:file` error and remains eligible for retry. A shard whose rows all have outcomes is complete even when individual videos produced errors. Stderr reports throughput plus cumulative decoder-worker time (including conversion and rotation, excluding batch handoff) and main-thread inference/counting time. In fast mode the stages overlap, and decoder time sums across threads.
 
 The writer syncs results to disk before checkpointing a shard. When resuming, it removes old rows for the selected unfinished work using a temporary copy of the JSONL in the output directory, then appends replacements. Allow room for this copy. Other shards and rows outside the selected limit are retained. Use one invocation per output path and keep input contents, basenames, weights and inference flags consistent across resumed chunks. Use a different output path for a different experiment.
 
 ## Validate against the reference
+
+Run `python -m unittest test_regressions` after installation to check row IDs after a damaged page, a duration cutoff inside a timestamp gap, and reference votes at exact second boundaries. These small synthetic cases require no weights or dataset download.
 
 ```bash
 python run.py --input /data/shards --output reference.jsonl --reference --limit-files 1 --limit-videos 3
@@ -68,7 +69,7 @@ python run.py --input /data/shards --output fast.jsonl --limit-files 1 --limit-v
 python evaluate.py --ref reference.jsonl --pred fast.jsonl
 ```
 
-This is the validation procedure to run on the target machine. No measured accuracy or throughput is included. The reference shares timestamp, orientation and aggregation code with the fast path. The comparison exercises batch inference, scheduling, sampling and precision. FP16 can change borderline confidence or NMS decisions. For a batch-only comparison, add `--no-half` to the fast command. A stride above 1 changes the frame population used for presence and medians.
+The serial reference writes one temporary MP4 at a time. FFmpeg decodes and autorotates its frames; a second, single-threaded PyAV pass reads the original presentation timestamps. Frames and timestamps are paired in presentation order with a frame-count check. The reference uses independent rational bucketing, per-frame class counts, majority voting and median calculation. It shares the local checkpoint, Ultralytics predictor and Parquet reader with the fast path. This comparison can expose disagreements in rotation, timestamps, aggregation and FP16 decisions. FFmpeg builds can also differ slightly in pixel conversion. To isolate a speed change, compare two fast runs on identical inputs and hardware, changing one flag. A stride above 1 changes the frame population used for presence and medians.
 
 `evaluate.py` aligns records by video and second and reports micro object-presence F1, exact people agreement, people agreement within one, and error-line counts. A missing second contributes an empty object set and a mismatch to both people metrics. An entirely empty object comparison has F1 1. An empty union of seconds has people agreement 0. PASS requires F1 ≥ 0.95, exact ≥ 85% and within-one ≥ 95%. Exit codes are 0 for PASS, 1 for FAIL and 2 for invalid input. Duplicate second records are invalid.
 
@@ -77,8 +78,7 @@ This is the validation procedure to run on the target machine. No measured accur
 Enable a GPU accelerator. Use an internet-enabled preparation session or attach previously prepared weights and wheels as notebook inputs. Kaggle images already have a paired torch and torchvision installation. In a notebook shell, run the following in the project directory to keep those packages. These commands assume the standard Kaggle scientific stack, including NumPy, OpenCV, PyArrow, PyYAML, Matplotlib, SciPy, Pillow, psutil, Polars and requests.
 
 ```bash
-python -m pip install --no-deps ultralytics==8.3.200 ultralytics-thop==2.0.17 av==16.0.1
-python prepare.py
+python kaggle_run.py setup
 ```
 
 For an attached checkpoint, pass its path with `--weights`. Kaggle's preinstalled package versions can differ from the grader pins.
@@ -91,11 +91,15 @@ After cloning the project, run these Kaggle notebook commands from its directory
 !python kaggle_run.py access
 !python kaggle_run.py setup
 !python kaggle_run.py sample --videos 1 --minutes 15
-!python kaggle_run.py next --minutes 60
+!python kaggle_run.py hour
 !python kaggle_run.py status
 ```
 
-The setup command performs the installation and weight preparation described above. The sample command times fast and reference inference on the same rows, allows 15 minutes for each run, and saves both JSONL files plus the evaluator output in `/kaggle/working/takehome-results/summary-1.json`. The next command downloads one shard at a time and appends to `results.jsonl` in that directory. Repeat it for additional full shards. The minute caps apply to inference and exclude downloads. After a timeout, finished videos may already have output; the next invocation retries the unfinished shard. Save the JSONL and its matching .done file together across Kaggle sessions. Report the measured sample and completed shard count when submitting partial results.
+The sample command times fast and reference inference on the same rows, allows 15 minutes for each run, and saves both JSONL files plus the evaluator output in `/kaggle/working/takehome-results/summary-1.json`. Run setup again when upgrading from 8.3.200. Run the sample again to measure the new implementation.
+
+For **one hour of footage**, run `python kaggle_run.py hour`. It walks videos in order and writes `/kaggle/working/takehome-results/results-one-hour.jsonl.gz` after producing exactly 3,600 per-second records. Each video's final fractional second counts as one bucket, timestamp gaps count, and error lines consume zero seconds. The last video can end at the sample boundary. Wall time depends on the GPU. Save `one-hour-parts/` to resume completed portions across sessions.
+
+For **all 50 shards**, run `python kaggle_run.py all`. It resumes the full-run checkpoints, processes remaining shards consecutively, and publishes `/kaggle/working/takehome-results/results.jsonl.gz` after all 50 are checkpointed. Copy that archive into the repository for submission. To process one full shard per invocation, use `python kaggle_run.py next --minutes 60`. The next command also compresses the results when the last shard finishes. New full-run and one-hour downloads use temporary storage one shard at a time. The sample command retains its first shard for reuse. The full run and the one-hour sample keep separate outputs. Keep full-run JSONL and .done files together across sessions and use consistent package versions in a resumed run.
 
 To download all assigned files during a separate preparation session using the pinned Hub client:
 
