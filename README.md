@@ -83,11 +83,25 @@ python prepare.py
 
 For an attached checkpoint, pass its path with `--weights`. Kaggle's preinstalled package versions can differ from the grader pins.
 
-Attach the assignment's Parquet dataset through **Add Input**, or download the assigned shards from the dataset provider during preparation. For a Hugging Face dataset, a typical download with the pinned Hub client is shown below. Replace the repository ID and shard pattern with the assignment's actual values. The dataset identifier was not provided.
+The assignment uses shards 00000 through 00049 from HuggingFaceFV/finevideo. Sign in as the owner of the read token, accept the dataset terms, and enable the `HF_TOKEN` secret for the Kaggle notebook. A fine-grained token needs permission to read the gated dataset. [FineVideo access page](https://huggingface.co/datasets/HuggingFaceFV/finevideo)
+
+After cloning the project, run these Kaggle notebook commands from its directory. Each command can run in its own cell. Start with the access check, which prints the token owner's username and checks file metadata on the first shard before downloading any data.
+
+```python
+!python kaggle_run.py access
+!python kaggle_run.py setup
+!python kaggle_run.py sample --videos 1 --minutes 15
+!python kaggle_run.py next --minutes 60
+!python kaggle_run.py status
+```
+
+The setup command performs the installation and weight preparation described above. The sample command times fast and reference inference on the same rows, allows 15 minutes for each run, and saves both JSONL files plus the evaluator output in `/kaggle/working/takehome-results/summary-1.json`. The next command downloads one shard at a time and appends to `results.jsonl` in that directory. Repeat it for additional full shards. The minute caps apply to inference and exclude downloads. After a timeout, finished videos may already have output; the next invocation retries the unfinished shard. Save the JSONL and its matching .done file together across Kaggle sessions. Report the measured sample and completed shard count when submitting partial results.
+
+To download all assigned files during a separate preparation session using the pinned Hub client:
 
 ```bash
-huggingface-cli download OWNER/DATASET --repo-type dataset \
-    --include 'data/train-*.parquet' --local-dir /kaggle/working/dataset
+huggingface-cli download HuggingFaceFV/finevideo --repo-type dataset \
+    --include 'data/train-000[0-4]*.parquet' --local-dir /kaggle/working/dataset
 ```
 
 Set `SHARDS` to the directory that directly contains the Parquet files. Keep output and sidecar in writable storage. To process five new files each time, repeat the same command until stderr reports no remaining files.
